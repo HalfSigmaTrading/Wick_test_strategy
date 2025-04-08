@@ -1,0 +1,112 @@
+//@version=6
+strategy("Matt Miller Wick Test Strategy - Revised", overlay=true, initial_capital=20000, default_qty_type=strategy.fixed, default_qty_value=1, margin_long = 0 , margin_short = 0)
+
+// Variables d'état et de suivi
+var int state = 0          // 0: aucune formation en cours; 1: bougie 1 détectée; 2: bougie 2 validée; 3: ordre placé
+var int cand1_bar = na     // Index de la bougie 1 candidate
+var float cand1_range = na // Plage de la bougie 1 (high - low)
+var float cand1_low = na   // Low de la bougie 1
+var float cand1_high = na  // High de la bougie 1
+var bool wick_high = false // wick high sur bougie 1
+var bool wick_low = false  // wick low sur bougie 1
+var int candidateDir = 0   // 1 pour LONG, -1 pour SHORT
+var float orderPrice = na  // Niveau d'entrée (issu de la wick de la bougie 1)
+var float longSL = na      // Stop Loss pour LONG
+var float shortSL = na     // Stop Loss pour SHORT
+tp = input.int(10, "Take profit (handles)") // 1 point = 4 ticks (adapté à NQ)
+sl = input.int(50, "Stop Loss (handles)")  // 1 point = 4 ticks (adapté à NQ)
+WRBbody = input.int(79, "Expansion candle body %")  
+candle2_SIZE_wrt_candle1 = input.float(1.5, "candle2 = candle1 x")  
+
+tick = syminfo.mintick
+
+// Pour l'affichage
+var label orderLabel = na
+var label cancelLabel = na
+
+// On ne prend en compte une nouvelle formation que s'il n'y a aucun trade en cours
+if strategy.position_size != 0
+    state := 0
+
+// === ETAPE 1 : Détection de la bougie candidate (bougie 1) ===
+// Condition spécifique selon le sens du trade
+if state == 0 and strategy.position_size == 0
+    // Pour LONG, la bougie 1 doit avoir une mèche haute existante (high > max(open, close))
+    if (high - math.max(open, close)) > 0
+        wick_high := true
+    else
+        wick_high := false
+
+    // Pour SHORT, la bougie 1 doit avoir une mèche basse existante (min(open, close) - low > 0)
+    if (math.min(open, close) - low) > 0
+        wick_low := true
+    else
+        wick_low := false  
+        
+    // information sur la bougie 1
+    if wick_high or wick_low
+        state := 1
+        cand1_range := high - low
+        cand1_bar := bar_index
+        cand1_low := low
+        cand1_high := high
+
+// === ETAPE 2 : Vérification de la bougie d'expansion (bougie 2) ===
+if state == 1 and bar_index == cand1_bar + 1
+    candle2_range = high - low
+    candle2_body  = math.abs(close - open)
+    // Vérification que le corps représente au moins WRBbody% de la bougie 2
+    bodyCondition = (candle2_body / candle2_range) >= (WRBbody/100)
+    // Pour LONG : bougie 2 haussière, expansion vers le haut et range >= candle2_SIZE_wrt_candle1 x celle de bougie 1
+    if wick_high and close > open and candle2_range >= candle2_SIZE_wrt_candle1 * cand1_range and high > cand1_high and bodyCondition
+        // Définition du Stop Loss : sous le plus bas low entre bougie 1 et bougie 2 - 1 tick
+        longSL := math.min(cand1_low, low) - tick
+        // Le niveau d'entrée est le niveau de la mèche de bougie 1 (haut)
+        orderPrice := cand1_high
+        // Révision du SL s'il est trop large
+        if math.abs(orderPrice - longSL) > sl
+            longSL := orderPrice - sl
+        candidateDir := 1
+        state := 2
+    // Pour SHORT : bougie 2 baissière, expansion vers le bas et range >= candle2_SIZE_wrt_candle1 x celle de bougie 1
+    else if wick_low and open > close and candle2_range >= candle2_SIZE_wrt_candle1 * cand1_range and low < cand1_low and bodyCondition
+        // Définition du Stop Loss : au-dessus du plus haut high entre bougie 1 et bougie 2 + 1 tick
+        shortSL := math.max(cand1_high, high) + tick
+        // Le niveau d'entrée est le niveau de la mèche de bougie 1 (bas)
+        orderPrice := cand1_low
+        // Révision du SL s'il est trop large
+        if math.abs(orderPrice - shortSL) > sl
+            shortSL := orderPrice + sl
+
+        candidateDir := -1
+        state := 2
+    else
+        state := 0  // Conditions non remplies, on réinitialise
+
+// === ETAPE 3 : Placement de l'ordre à l'ouverture de la bougie 3 (clôture de bougie 2) ===
+if state == 2 and bar_index == cand1_bar + 1
+    if candidateDir == 1
+        strategy.order("LongEntry", strategy.long, qty=1, limit=orderPrice)
+        strategy.exit("LongExit", from_entry="LongEntry", stop=longSL, limit=orderPrice + tp)
+        orderLabel := label.new(bar_index, orderPrice, text="Order Placed (LONG)", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+    else if candidateDir == -1
+        strategy.order("ShortEntry", strategy.short, qty=1, limit=orderPrice)
+        strategy.exit("ShortExit", from_entry="ShortEntry", stop=shortSL, limit=orderPrice - tp)
+        orderLabel := label.new(bar_index, orderPrice, text="Order Placed (SHORT)", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+    state := 3
+
+// === ETAPE 4 : Annulation de l'ordre si non exécuté à l'ouverture de la bougie 4 (clôture de bougie 3) ===
+if state == 3 and bar_index == cand1_bar + 2
+    if strategy.position_size == 0
+        if candidateDir == 1
+            strategy.cancel("LongEntry")
+            cancelLabel := label.new(bar_index, orderPrice, text="Order Cancelled (LONG)", style=label.style_label_left, color=color.orange, textcolor=color.black, size=size.small)
+        else if candidateDir == -1
+            strategy.cancel("ShortEntry")
+            cancelLabel := label.new(bar_index, orderPrice, text="Order Cancelled (SHORT)", style=label.style_label_right, color=color.orange, textcolor=color.black, size=size.small)
+    state := 0
+
+// === Visualisation ===
+// Tracer le niveau d'entrée tant que l'ordre est actif
+if state >= 2
+    line.new(bar_index[1], orderPrice, bar_index, orderPrice, extend=extend.right, color=color.yellow, style=line.style_dashed)
